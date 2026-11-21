@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 端到端演示：发布 -> 幂等重试 -> 冲突拒绝 -> 取件 -> 两类证明 -> 离线核验 -> 篡改拒绝。
+# 端到端演示：发布 -> 幂等重试 -> 冲突拒绝(零残留) -> 取件 -> 两类证明 -> 离线核验 -> 篡改拒绝。
 # 用法：BASE=http://127.0.0.1:8001 bash scripts/demo.sh
 set -euo pipefail
 
@@ -26,12 +26,21 @@ curl -s -X POST "$BASE/releases" \
   -F station_id=ST01 -F sample_date=2026-11-16 -F order_no=ORD-001 \
   -F file=@"$WORK/day1.csv" | python3 -m json.tool
 
-echo "== 3. 同单异输入（期望 HTTP 409）=="
+echo "== 3. 同单异输入（期望 HTTP 409，被拒字节不落共享卷）=="
+REJECT_DIGEST="$(sha256sum "$WORK/day2.csv" | cut -d' ' -f1)"
+echo "被拒文件摘要: $REJECT_DIGEST"
 curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/releases" \
   -F station_id=ST01 -F sample_date=2026-11-16 -F order_no=ORD-001 \
   -F file=@"$WORK/day2.csv"
+if [ -n "${DATA_DIR:-}" ] && [ -d "$DATA_DIR/blobs" ]; then
+  if [ -e "$DATA_DIR/blobs/${REJECT_DIGEST:0:2}/${REJECT_DIGEST:2:2}/$REJECT_DIGEST" ]; then
+    echo "失败：被拒字节残留在共享卷" >&2
+    exit 1
+  fi
+  echo "已核对：共享卷原件库不存在被拒字节 $REJECT_DIGEST"
+fi
 
-echo "== 4. 第二件发布 =="
+echo "== 4. 第二件发布（不同单号，正常 201）=="
 curl -s -X POST "$BASE/releases" \
   -F station_id=ST02 -F sample_date=2026-11-16 -F order_no=ORD-002 \
   -F file=@"$WORK/day2.csv" | python3 -m json.tool

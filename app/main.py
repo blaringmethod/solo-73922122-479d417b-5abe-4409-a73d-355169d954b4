@@ -2,13 +2,15 @@
 
 流程与不变量
 ------------
-1. 上传先落共享卷（临时文件 fsync + 原子改名），写盘失败返回 507 且无库记录；
+1. 上传先暂存到共享卷临时区（fsync + 唯一文件名），暂存失败返回 507 且无库记录；
 2. 数据库事务 BEGIN IMMEDIATE 串行化双实例并发：
-   - 同 (站号, 日期, 单号) 同字节 -> 复用既有记录（幂等重试）；
-   - 同键异字节 -> 409 拒绝，记录不可改；
-   - 超累计上限 -> 409 拒绝；
-3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+   - 同 (站号, 日期, 单号) 同字节 -> 复用既有记录（幂等重试），丢弃暂存件；
+   - 同键异字节 -> 409 拒绝，事务回滚、暂存件丢弃，原件库/目录/检查点零新增；
+   - 超累计上限 -> 409 拒绝，同样零新增；
+3. 仅新增记录的事务在提交前把暂存件原子提升进内容寻址原件库，
+   提升失败回滚事务并返回 507，可原样重试；
+4. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
+5. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
 """
 from __future__ import annotations
 
@@ -114,23 +116,32 @@ async def publish_release(
     if len(data) == 0:
         raise HTTPException(422, "原件为空文件，拒绝发布")
 
+    # 阶段 1：先暂存到临时区（不进内容寻址原件库）。
+    # 暂存失败（空间/权限/IO）直接 507：无库记录、无原件库新增，可原样重试。
     try:
-        digest, _path = await run_in_threadpool(blob_store.store, data)
+        staged = await run_in_threadpool(blob_store.stage, data)
     except BlobError as exc:
-        # 写盘失败：无任何库记录，客户端可原样重试。
         return JSONResponse(status_code=507, content={"detail": str(exc)})
 
-    try:
-        record, reused = await run_in_threadpool(
-            database.publish,
-            station_id,
-            sample_date,
-            order_no,
-            digest,
-            len(data),
-        )
-    except ConflictError as exc:
-        raise HTTPException(409, str(exc))
+    # with 兜底：事务拒绝（409）、复用或任何异常路径下，暂存文件都被丢弃，
+    # 原件库里不会留下仅由本次请求产生的文件。
+    with staged:
+        try:
+            record, reused = await run_in_threadpool(
+                database.publish,
+                station_id,
+                sample_date,
+                order_no,
+                staged.digest,
+                staged.size,
+                # 阶段 2：仅当事务确认新增记录、提交前才提升为正式原件。
+                staged.promote,
+            )
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc))
+        except BlobError as exc:
+            # 提升失败：事务已回滚，无目录/检查点记录；暂存件由 with 清理。
+            return JSONResponse(status_code=507, content={"detail": str(exc)})
 
     checkpoint = await run_in_threadpool(database.latest_checkpoint)
     return PublishResult(

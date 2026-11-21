@@ -239,6 +239,121 @@ def main() -> int:
             # 无法 kill：改为脱离进程（它绑定临时目录，会话结束后随环境回收）。
             print(f"[note] 环境禁止 kill 信号，第三实例保留运行，端口 {PORT_C}")
 
+        # 6) 单号冲突清理：两实例并发对同一新单号提交不同内容，
+        #    必须一成一拒（409），败者字节不得残留在共享卷，目录/检查点不新增。
+        status_before, releases_before = get_json(PORT_A, "/releases")
+        _, cp_before = get_json(PORT_A, "/checkpoints/latest")
+        blob_root = Path(data_dir) / "blobs"
+        blobs_before = {p for p in blob_root.rglob("*") if p.is_file()}
+        tmp_root = Path(data_dir) / "tmp"
+        tmp_before = {p.name for p in tmp_root.iterdir() if p.is_file()}
+        conflict_a = b"station,ph\nCONFLICT,1.0\n"
+        conflict_b = b"station,ph\nCONFLICT,2.0-DIFFERENT\n"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            conflict_results = list(
+                pool.map(
+                    lambda item: post_release(
+                        item[1],
+                        "CFX",
+                        "2026-11-16",
+                        "ORD-CONFLICT",
+                        conflict_a if item[0] == 0 else conflict_b,
+                    ),
+                    enumerate([PORT_A, PORT_B]),
+                )
+            )
+        c_statuses = sorted(s for s, _ in conflict_results)
+        check(
+            c_statuses == [201, 409],
+            f"并发同单异内容：一成一拒（实际 {c_statuses}）",
+        )
+        blobs_after = {p for p in blob_root.rglob("*") if p.is_file()}
+        leftover = blobs_after - blobs_before
+        # 仅允许胜出者的一个新原件落盘；败者字节零残留。
+        check(
+            len(leftover) == 1 and leftover.pop().read_bytes()
+            in (conflict_a, conflict_b),
+            "冲突败者字节未残留在共享卷（仅胜者原件落盘）",
+        )
+        check(
+            {p.name for p in tmp_root.iterdir() if p.is_file()} == tmp_before,
+            "冲突后暂存区无残留文件",
+        )
+        _, releases_after = get_json(PORT_B, "/releases")
+        check(
+            len(releases_after) == len(releases_before) + 1,
+            "冲突仅新增胜者一条目录记录，败者无记录",
+        )
+        _, cp_after_conflict = get_json(PORT_B, "/checkpoints/latest")
+        check(
+            cp_after_conflict["seq"] == cp_before["seq"] + 1,
+            "检查点只为成功发布追加一次，拒绝不产生检查点",
+        )
+
+        # 7) 同字节异单号并发：两实例用相同字节发布不同单号，均成功且都可下载取证。
+        shared = b"station,ph\nSHARED-BYTES,7.7\n"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            shared_results = list(
+                pool.map(
+                    lambda item: post_release(
+                        item[1], "SHR", "2026-11-16", item[0], shared
+                    ),
+                    [("ORD-SHA-A", PORT_A), ("ORD-SHA-B", PORT_B)],
+                )
+            )
+        check(
+            sorted(s for s, _ in shared_results) == [201, 201],
+            "同字节异单号并发发布均成功",
+        )
+        shared_digest = shared_results[0][1]["release"]["blob_sha256"]
+        check(
+            all(p[1]["release"]["blob_sha256"] == shared_digest for p in shared_results),
+            "两条记录指向同一内容寻址原件",
+        )
+        for order, port in (("ORD-SHA-A", PORT_B), ("ORD-SHA-B", PORT_A)):
+            s_dl, got = get_bytes(
+                port, f"/releases/SHR/2026-11-16/{order}/download"
+            )
+            check(
+                s_dl == 200 and got == shared,
+                f"跨实例下载 {order} 字节一致",
+            )
+            s_proof, proof = get_json(
+                port, f"/releases/SHR/2026-11-16/{order}/inclusion-proof"
+            )
+            ok, msg = verify_release_bytes(proof, shared)
+            check(s_proof == 200 and ok, f"{order} 纳入证明跨实例可核验：{msg}")
+
+        # 8) 串行同单异内容再次确认 409 且零残留（单实例视角的拒绝路径）。
+        blobs_before_serial = {p for p in blob_root.rglob("*") if p.is_file()}
+        s1, _ = post_release(PORT_A, "SER", "2026-11-16", "ORD-SER", b"first\n")
+        s2, _ = post_release(PORT_A, "SER", "2026-11-16", "ORD-SER", b"second\n")
+        check(
+            s1 == 201 and s2 == 409,
+            f"串行同单异内容首件成功、次件 409（实际 {s1}/{s2}）",
+        )
+        check(
+            {p for p in blob_root.rglob("*") if p.is_file()} - blobs_before_serial
+            == {
+                next(
+                    p
+                    for p in blob_root.rglob("*")
+                    if p.is_file() and p.read_bytes() == b"first\n"
+                )
+            },
+            "串行 409 后原件库只多出首件字节，次件字节无残留",
+        )
+        check(
+            not {p.name for p in tmp_root.iterdir() if p.is_file()} - tmp_before,
+            "全部拒绝/复用路径结束后暂存区保持干净",
+        )
+        # 被拒后原样重试首件字节仍可幂等复用。
+        s3, body3 = post_release(PORT_A, "SER", "2026-11-16", "ORD-SER", b"first\n")
+        check(
+            s3 == 201 and body3["reused"] is True,
+            "冲突拒绝后同单同字节仍可幂等复用",
+        )
+
     finally:
         for proc in (proc_a, proc_b):
             if proc.poll() is None:

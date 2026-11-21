@@ -22,29 +22,29 @@ def test_disk_write_failure_leaves_no_record(app_client, monkeypatch):
     client, app, settings = app_client
     before = len(client.get("/releases").json())
 
-    def boom_store(self, data):
-        # 在写临时文件之前模拟磁盘不可写，等价于 ENOSPC。
+    def boom_stage(self, data):
+        # 在写暂存文件之前模拟磁盘不可写，等价于 ENOSPC。
         raise BlobError("模拟磁盘不可写")
 
-    monkeypatch.setattr(main_mod.BlobStore, "store", boom_store)
-    r = _publish(client, "FAIL", "2026-11-16", "ORD-F", b"x,y\n1,2\n")
+    monkeypatch.setattr(main_mod.BlobStore, "stage", boom_stage)
+    r = _publish(client, "FAIL", "2026-11-16", "ORD-FM-F", b"x,y\n1,2\n")
     assert r.status_code == 507
     # 数据库无记录，容量未被占用，失败后可原样重试。
     assert len(client.get("/releases").json()) == before
 
     monkeypatch.undo()
-    r2 = _publish(client, "FAIL", "2026-11-16", "ORD-F", b"x,y\n1,2\n")
+    r2 = _publish(client, "FAIL", "2026-11-16", "ORD-FM-F", b"x,y\n1,2\n")
     assert r2.status_code == 201 and r2.json()["reused"] is False
 
 
 def test_blob_store_raises_blob_error(app_client, monkeypatch):
     client, app, settings = app_client
 
-    def boom_write(self, data):
+    def boom_stage(self, data):
         raise BlobError("ENOSPC: 模拟共享卷写满")
 
-    monkeypatch.setattr("app.main.BlobStore.store", boom_write)
-    r = _publish(client, "FAIL2", "2026-11-16", "ORD-F2", b"abc")
+    monkeypatch.setattr("app.main.BlobStore.stage", boom_stage)
+    r = _publish(client, "FAIL2", "2026-11-16", "ORD-FM-F2", b"abc")
     assert r.status_code == 507
     assert len(client.get("/releases").json()) == client.get("/health").json()[
         "release_count"
@@ -54,7 +54,7 @@ def test_blob_store_raises_blob_error(app_client, monkeypatch):
 def test_restart_integrity_check_detects_missing_blob(app_client, monkeypatch):
     client, app, settings = app_client
     data = b"station,ph\nS9,7.0\n"
-    r = _publish(client, "S9", "2026-11-16", "ORD-9", data)
+    r = _publish(client, "S9", "2026-11-16", "ORD-FM-9", data)
     assert r.status_code == 201
     digest = r.json()["release"]["blob_sha256"]
 
@@ -70,10 +70,10 @@ def test_restart_integrity_check_detects_missing_blob(app_client, monkeypatch):
     monkeypatch.setattr(main_mod, "_startup_problems", problems)
     assert client.get("/health").json()["status"] == "degraded"
     assert client.get(
-        "/releases/S9/2026-11-16/ORD-9/inclusion-proof"
+        "/releases/S9/2026-11-16/ORD-FM-9/inclusion-proof"
     ).status_code == 503
     assert client.get(
-        "/releases/S9/2026-11-16/ORD-9/download"
+        "/releases/S9/2026-11-16/ORD-FM-9/download"
     ).status_code == 503
     # 发布也被拒绝，避免在缺件状态上继续追加。
     assert _publish(client, "S10", "2026-11-16", "ORD-10", b"z").status_code == 503
@@ -92,7 +92,7 @@ def test_orphan_files_are_harmless_and_tamper_is_detected(app_client):
     """崩溃残留：临时文件/未引用原件不影响服务；已引用原件被改则自检失败。"""
     client, app, settings = app_client
     data = b"station,ph\nS8,6.9\n"
-    r = _publish(client, "S8", "2026-11-16", "ORD-8", data)
+    r = _publish(client, "S8", "2026-11-16", "ORD-FM-8", data)
     assert r.status_code == 201
     digest = r.json()["release"]["blob_sha256"]
 

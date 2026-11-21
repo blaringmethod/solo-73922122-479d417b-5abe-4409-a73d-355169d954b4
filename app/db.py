@@ -6,6 +6,13 @@
 * 发布事务使用 ``BEGIN IMMEDIATE``，跨实例写操作被数据库锁串行化，
   后到者阻塞等待后重检唯一键，因此不会分叉、不会互相覆盖。
 * 无任何 UPDATE/DELETE 路径，发布后记录不可改、不可删。
+
+原件提升时机
+------------
+调用方先把请求字节暂存到临时区，再进入发布事务。仅当事务确认新增记录时，
+才在提交前调用 ``promote_blob`` 回调把暂存件提升为内容寻址原件；
+冲突拒绝、限额拒绝与同键复用路径都不会调用该回调，因此被拒请求在原件库、
+发布目录与检查点中均无新增。提升回调抛错时事务整体回滚。
 """
 from __future__ import annotations
 
@@ -13,8 +20,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator
 
 from . import merkle
 from .config import Settings
@@ -103,17 +109,28 @@ class Database:
         order_no: str,
         blob_sha256: str,
         size: int,
+        promote_blob: Callable[[], None] | None = None,
     ) -> tuple[dict, bool]:
         """串行化发布。返回 (发布记录, 是否复用既有记录)。
 
-        调用方必须已把原件原子落盘成功后再调用本方法，
-        从而保证“库中有记录 => 卷上有完整原件”。
+        调用方先把原件暂存到临时区再调用本方法。仅当事务确认要新增记录时，
+        才在提交前调用 ``promote_blob`` 把暂存文件提升为内容寻址原件：
+
+        * 同键异字节/超限额 -> 冲突或限额拒绝，事务回滚且**不调用**提升回调，
+          原件库与检查点均无新增，调用方丢弃暂存文件即可；
+        * 同键同字节 -> 只读复用，同样不提升、不产生写入；
+        * 提升回调抛错（写盘失败）-> 事务回滚，无库记录，调用方可原样重试。
         """
         # 双实例并发时 BEGIN IMMEDIATE 可能撞上写锁；busy_timeout 之外再有限重试。
         for attempt in range(3):
             try:
                 return self._publish_once(
-                    station_id, sample_date, order_no, blob_sha256, size
+                    station_id,
+                    sample_date,
+                    order_no,
+                    blob_sha256,
+                    size,
+                    promote_blob,
                 )
             except sqlite3.OperationalError as exc:
                 if "locked" in str(exc).lower() and attempt < 2:
@@ -129,6 +146,7 @@ class Database:
         order_no: str,
         blob_sha256: str,
         size: int,
+        promote_blob: Callable[[], None] | None,
     ) -> tuple[dict, bool]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -144,7 +162,7 @@ class Database:
                         record["blob_sha256"] == blob_sha256
                         and record["size"] == size
                     )
-                    conn.rollback()  # 只读复用，不产生写入
+                    conn.rollback()  # 只读复用/拒绝，不产生写入，也不提升暂存件
                     if not same:
                         raise ConflictError(
                             "同一站号/日期/发布单号已存在且原件内容不同，禁止改写"
@@ -155,7 +173,7 @@ class Database:
                     "SELECT COUNT(*) AS c FROM releases"
                 ).fetchone()["c"]
                 if count >= self._settings.max_releases:
-                    conn.rollback()
+                    conn.rollback()  # 限额拒绝：不提升暂存件、不新增检查点
                     raise ConflictError(
                         f"累计发布已达上限 {self._settings.max_releases} 件"
                     )
@@ -183,6 +201,10 @@ class Database:
                     "VALUES (?, ?, ?)",
                     (len(leaves), root.hex(), _utcnow()),
                 )
+                # 提交前在同一写锁内提升暂存原件：提升失败则整体回滚，
+                # 保证“已提交记录 => 卷上有完整原件”，反之被拒请求零残留。
+                if promote_blob is not None:
+                    promote_blob()
                 conn.commit()
             except Exception:
                 conn.rollback()
